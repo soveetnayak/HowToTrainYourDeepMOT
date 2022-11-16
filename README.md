@@ -9,4 +9,4 @@
 * Naimeesh Tiwari
 * Soveet Nayak
 
-### The repository contains all files codes required for the understanding and implmentation of the paper How to train your Deep Multi-Object Tracker.
+### The repository contains all files and codes required for the understanding and implmentation of the paper How to train your Deep Multi-Object Tracker.
