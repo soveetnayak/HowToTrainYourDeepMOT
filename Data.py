@@ -73,6 +73,9 @@ test_dataset = Dataset(data_dir, train=False)
 train_loader = data.DataLoader(train_dataset, batch_size=1, shuffle=True)
 test_loader = data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
+print(len(train_dataset))
+print(len(test_dataset))
+
 for i, (data, label) in enumerate(train_loader):
     print(data.shape)
     print(data)
