@@ -30,7 +30,7 @@ using w0 = n1/(n0 + n1). We weight the one-class by
 w1 = 1 − w0. We evaluate the performance of DHN by
 computing the weighted accuracy (WA)
 '''
-import inflection
+# import inflection
 import torch
 import torch.nn as nn
 
@@ -84,7 +84,7 @@ class Deep_Hungarian_net(nn.Module):
         #  shape of x: (batch_size, h,w)
         #  shape of x_row: (h*w, batch_size, 1)
         x_row = x.view(x.size(0), -1, 1)
-        x_row = x_row.permute(1,0,2)
+        x_row = x_row.permute(1,0,2).contiguous()
 
         #feed the data into the Bi-rnn
         #  shape of x_row: (h*w, batch_size, 1)
@@ -101,7 +101,7 @@ class Deep_Hungarian_net(nn.Module):
 
         #column-wise flatten the output of the Bi-rnn
         #  shape of x_col: (h*w, batch_size, hidden_size*2)
-        x_col = x_row_out.permute(1,0,2,3)
+        x_col = x_row_out.permute(1,0,2,3).contiguous()
         x_col = x_col.view(-1, x_col.size(2), x_col.size(3))
 
         #feed the column-wise flattened output into the Bi-rnn
@@ -114,7 +114,13 @@ class Deep_Hungarian_net(nn.Module):
 
         # output shape of x_col_out to (h, w, batch_size, hidden_size*2)
 
-        x_col_out = x_col_out.view(x.size(1)*x.size(2) * x_col_out.size(2), x_col_out.size(3))
+        # x_col_out = x_col_out.view(x.size(1)*x.size(2) * x_col_out.size(2), x_col_out.size(3))
+        x_col_out = x_col_out.view(x.size(2), x.size(1), x.size(0), -1)
+        x_col_out = x_col_out.permute(1,0,2,3).contiguous()
+
+        #shape of x_col_out: (h, w, batch_size, hidden_size*2)\
+        x_col_out = x_col_out.view(x_col_out.size(0)*x_col_out.size(1)*x_col_out.size(2), x_col_out.size(3))
+        
 
 
         lin_out = self.fc1(x_col_out)
@@ -124,7 +130,7 @@ class Deep_Hungarian_net(nn.Module):
 
         sigmoid_out = torch.sigmoid(lin_out)
 
-        return sigmoid_out.view(x.size(1), x.size(2), x.size(0)).permute(2,0,1)
+        return sigmoid_out.view(x.size(1), x.size(2), x.size(0)).permute(2,0,1).contiguous()
 
 
 
