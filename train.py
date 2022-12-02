@@ -1,208 +1,218 @@
-from model import Deep_Hungarian_net as Munkrs
+from model import Deep_Hungarian_net 
 import torch.optim as optim
-from Data import Dataset as RealData
+from Data import Dataset
 import torch
 import numpy as np
-# try:
-#     from tensorboardX import SummaryWriter
-# except:
-#     from torch.utils.tensorboard import SummaryWriter
-from utils import adjust_learning_rate, eval_acc
-# from loss.DICE import soft_dice_loss
+from torch.utils.tensorboard import SummaryWriter
 import shutil
 import os
 import argparse
 from os.path import realpath, dirname
 
-def weighted_binary_focal_entropy(output, target, weights=None, gamma=2):
-    # output = torch.clamp(output, min=1e-8, max=1 - 1e-8)
+
+def focal_loss(y_pred, y_target, weights=None, gamma=2):
+    # y_pred = torch.sigmoid(y_pred)
+    y_pred = torch.clamp(y_pred, 1e-8, 1 - 1e-8)
+    y_target = y_target.float()
+    
     if weights is not None:
-        assert weights.size(1) == 2
-
-        # weight is of shape [batch,2, 1, 1]
-        # weight[:,1] is for positive class, label = 1
-        # weight[:,0] is for negative class, label = 0
-
-        loss = (torch.pow(1.0-output, gamma)*torch.mul(target, weights[:, 1]) * torch.log(output+1e-8)) + \
-               (torch.mul((1.0 - target), weights[:, 0]) * torch.log(1.0 - output+1e-8)*torch.pow(output, gamma))
+        bin_foc_l = (torch.pow(1.0-y_pred, gamma)* torch.log(y_pred+1e-8))*torch.mul(weights[:, 1], y_target)
+        bin_foc_l += (torch.pow(y_pred, gamma)* torch.log(1.0-y_pred+1e-8))*torch.mul(weights[:, 0], 1.0-y_target)
+        ret_val = torch.mean(bin_foc_l)
+        ret_val = torch.neg(ret_val)
     else:
-        loss = target * torch.log(output+1e-8) + (1 - target) * torch.log(1 - output+1e-8)
+        bin_foc_l = torch.log(y_pred+1e-8)*y_target 
+        bin_foc_l += (1-y_target)*torch.log(1-y_pred+1e-8)
+        ret_val = torch.mean(bin_foc_l)
+        ret_val = torch.neg(ret_val)
 
-    return torch.neg(torch.mean(loss))
+    return ret_val
+
+
+def save_checkpt(model, epoch, optimizer, best_acc):
+    state = {
+        'epoch' : epoch + 1,
+        'model' : model.state_dict(),
+        'best_accuracy' : best_acc,
+        'optimizer' : optimizer.state_dict(),
+    }
+    torch.save(state, 'model_best_checkpoint_epoch' +str(epoch)+'.pth.tar')
+
+def weighted_acc(tag_score, y_target, weight):
+    accuracy = []
+    y_pred = torch.zeros(tag_score.size(), layout=tag_score.layout).cuda().float()
+
+    for batch in range(tag_score.size(0)):
+        for row in range(tag_score.size(1)):
+            val, ind = tag_score[batch, row].max(0)
+            if float(val) > 0.5:
+                y_pred[batch, row, int(ind)] = 1.0
+        
+        tot_p = float(y_target[batch, :, :].sum()) # adding ones i.e. total positives
+        size = y_target.size(1)*y_target.size(2)
+        tot_n = float(size-tot_p)
+        
+        tp = float((torch.mul(y_pred[batch, :, :],y_target[batch, :, :])).sum())
+        tn = float((torch.mul(torch.sub(1,y_pred[batch, :, :]),torch.sub(1,y_target[batch, :, :]))).sum())
+
+        acc = (1.0*(tp * float(weight[batch, 1, 0, 0]) + tn * float(weight[batch, 0, 0, 0]))/
+                   (tot_p * float(weight[batch, 1, 0, 0]) + tot_n * float(weight[batch, 0, 0, 0])))
+        accuracy.append(acc)
+    
+    return y_pred,torch.mean(torch.tensor(accuracy))
+          
+def get_weight(target,train=True):
+    size_tar = target.size(1)*target.size(2)
+    if train:    
+        tot_p = target.detach().clone()
+    else:
+        tot_p = target.data
+
+    tot_p = tot_p.view(target.size(0),-1).sum(dim = 1).unsqueeze(1)
+    w2 = tot_p.float()/size_tar
+    # case all zeros, then weight2negative = 1.0
+    w2.masked_fill_((w2 == 0.0), 10)  # 10 is just a symbolic value representing 1.0
+    # case all ones, then weight2negative = 0.0
+    w2.masked_fill_((w2 == 1.0), 0.0)
+    # change all fake values 10 to their desired value 1.0
+    w2.masked_fill_((w2 == 10), 1.0)
+
+    w1 = 1.0 - w2
+    weight = torch.cat([w2,w1],dim=1)
+    weight = weight.view(-1,2,1,1).contiguous()
+    if is_cuda:
+        weight = weight.cuda()
+    return weight
 
 
 
+learning_rate = 0.0003
+last_acc = 0.0
+curr_path = realpath(dirname(__file__))           
+    
 
 
-
+torch.manual_seed(1)
+torch.cuda.manual_seed(1)
+np.random.seed(1)
+torch.backends.cudnn.deterministic = True
 
 # model #
-model = Munkrs(1,256, 1)
+model = Deep_Hungarian_net(element_size=1,hidden_size=256, targe_size=1)
 model = model.train()
+model = model.cuda()
 
 # optimizer #
-optimizer = optim.RMSprop(model.parameters(), lr=0.00003)
-
-# load and finetune model #
-starting_epoch = 0
+optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
 
 
+# TensorboardX logs #
+
+train_writer = SummaryWriter(os.path.join(curr_path, 'log/', 'train'))
+val_writer = SummaryWriter(os.path.join(curr_path, 'log/', 'test'))
 
 
 # data loaders #
-train_dataset = RealData("./DHN_data/", train=True)
-val_dataset = RealData("./DHN_data/", train=False)
-train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=1)
-val_dataloader =torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=True, num_workers=1)
+train_dataset = Dataset("./DHN_data/", train=True)
+val_dataset = Dataset("./DHN_data/", train=False)
+train_dl = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=1)
+val_dl =torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=True, num_workers=1)
 
-print('val length in #batches: ', len(val_dataloader.dataset))
-print('train length in #batches: ', len(train_dataloader.dataset))
+print(f"Train dataset length = {len(train_dl.dataset)} no. of batches")
+print(f"Validation dataset length = {len(val_dl.dataset)} no. of batches")
 
-
-
+# training #
+is_cuda = True # set if your device supports cuda
 is_best = False
 val_loss = None
-
-starting_iterations = 0
-iteration = 0
-iteration += starting_iterations
-if iteration > 0 and iteration % len(train_dataloader.dataset) == 0:
-    starting_epoch += 1
-for epoch in range(max(0, starting_epoch), 1):
-
-    for Dt, target in train_dataloader:
+iterations =0
+for epoch in range(3):
+    for Dist,target in train_dl:
 
         model = model.train()
-        Dt = Dt.squeeze(0)
+        Dist = Dist.squeeze(0)
         target = target.squeeze(0)
-        # if args.is_cuda:
-        #     Dt = Dt.cuda()
-        #     target = target.cuda()
-
+        if is_cuda:
+            Dist = Dist.cuda()
+            target = target.cuda()
+        
+        weight = get_weight(target)
         # after each sequence/matrix Dt, we init new hidden states
-        model.hidden_row = model.init_hidden(Dt.size(0))
-        model.hidden_col = model.init_hidden(Dt.size(0))
+        model.hidden_row = model.init_hidden(Dist.size(0))
+        model.hidden_col = model.init_hidden(Dist.size(0))
 
-        # input to model
-        tag_scores = model(Dt)
-        # num_positive = how many labels = 1
-        num_positive = target.detach().clone().view(target.size(0), -1).sum(dim=1).unsqueeze(1)
-        weight2negative = num_positive.float()/(target.size(1)*target.size(2))
-        # case all zeros, then weight2negative = 1.0
-        weight2negative.masked_fill_((weight2negative == 0.0), 10)  # 10 is just a symbolic value representing 1.0
-        # case all ones, then weight2negative = 0.0
-        weight2negative.masked_fill_((weight2negative == 1.0), 0.0)
-        # change all fake values 10 to their desired value 1.0
-        weight2negative.masked_fill_((weight2negative == 10), 1.0)
-        weight = torch.cat([weight2negative, 1.0 - weight2negative], dim=1)
-        weight = weight.view(-1, 2, 1, 1).contiguous()
-        # if args.is_cuda:
-        #     weight = weight.cuda()
+        # forward pass
+        tag_score = model(Dist)
+    
+        #loss
+        loss = focal_loss(tag_score, target.float(), weights=weight)
+        train_writer.add_scalar('Loss/train', loss.item(), iterations)
 
-        loss = 10.0 * weighted_binary_focal_entropy(tag_scores, target.float(), weights=weight)
 
-        # clean gradients & back propagation
+        # backward pass
         model.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # adjust learning weight
-        old_lr = adjust_learning_rate(optimizer, iteration, 0.00003)
-
-        # # show loss
-        # train_writer.add_scalar('Loss', loss.item(), iteration)
-        # if val_loss is None:
-        #     val_loss = loss.item()
-        # val_writer.add_scalar('Loss', val_loss, iteration)
-
-        if iteration % 1 == 0:
-            print('Epoch: [{}][{}/{}]\tLoss {:.4f}'.format(epoch, iteration % len(train_dataloader.dataset),
-                                                            len(train_dataloader.dataset), loss.item()))
-
-        if iteration % 1 == 0:
+        # accuracy
+        if iterations % 10 == 0:
+            print('Epoch: [{}][{}/{}]\tLoss {:.4f}'.format(epoch, iterations % len(train_dl.dataset),len(train_dl.dataset), loss.item()))
+        
+        if iterations % 20 == 0:
             model = model.eval()
-            test_loss = []
-            acc = []
-            test_j = []
-            test_p = []
-            test_r = []
-            # val = random.sample(valset, 50)
-            for test_num, (data, target) in enumerate(val_dataloader):
+            val_acc = []
+            val_loss = []
+            val_p = []
+            val_r = []
+
+            for val_i,(data,target) in enumerate(val_dl):
                 data = data.squeeze(0)
                 target = target.squeeze(0)
-                if test_num == 50:
+                if is_cuda:
+                    data = data.cuda()
+                    target = target.cuda()
+                if val_i == 50:
                     break
-                # if args.is_cuda:
-                #     data = data.cuda()
-                #     target = target.cuda()
-                # after each sequence/matrix Dt, we init new hidden states
+                weight = get_weight(target,train=False)
                 model.hidden_row = model.init_hidden(data.size(0))
                 model.hidden_col = model.init_hidden(data.size(0))
+                tag_score = model(data)
 
-                # input to model
-                tag_scores = model(data)
+                loss = 10.0 * focal_loss(tag_score, target.float(), weights=weight)
+                val_loss.append(loss.item())
+                # val_writer.add_scalar('Loss/val', loss.item(), iterations)
+                y_pred,acc = weighted_acc(tag_score.float().detach(),target.float().detach(),weight.detach())
+                val_acc.append(acc)
+                # val_writer.add_scalar('Accuracy/val', acc, iterations)
 
-                num_positive = target.data.view(target.size(0), -1).sum(dim=1).unsqueeze(1)
-                # print num_positive
-                weight2negative = num_positive.float() / (target.size(1) * target.size(2))
-                # case all zeros
-                weight2negative.masked_fill_((weight2negative == 0), 10)  # 10 is just a symbolic value representing 1.0
-                # case all ones
-                weight2negative.masked_fill_((weight2negative == 1), 0.0)
-                weight2negative.masked_fill_((weight2negative == 10), 1.0)  # change all 100 to their true value 1.0
-                weight = torch.cat([weight2negative, 1.0 - weight2negative], dim=1)
-                # print weight
-                weight = weight.view(-1, 2, 1, 1).contiguous()
-                # print weight
-                # if args.is_cuda:
-                #     weight = weight.cuda()
+                # calaculating jacard precesion
+                tp = torch.sum((y_pred == target.float().detach())[target.data == 1.0]).double()
+                fp = torch.sum((y_pred != target.float().detach())[y_pred.data == 1.0]).double()
+                fn = torch.sum((y_pred != target.float().detach())[y_pred.data == 0.0]).double()
 
-                loss = 10.0 * weighted_binary_focal_entropy(tag_scores, target.float(), weights=weight)
 
-                test_loss.append(float(loss.item()))
-                # scores = F.sigmoid(tag_scores)
-                predicted, curr_acc = eval_acc(tag_scores.float().detach(), target.float().detach(), weight.detach())
-                acc.append(curr_acc)
+                p = tp/(tp+fp + 1e-9)
+                r = tp/(tp+fn + 1e-9)
+                val_p.append(p.item())
+                val_r.append(r.item())
 
-                # calculate J value
-                tp = torch.sum((predicted == target.float().detach())[target.data == 1.0]).double()
-                fp = torch.sum((predicted != target.float().detach())[predicted.data == 1.0]).double()
-                fn = torch.sum((predicted != target.float().detach())[predicted.data == 0.0]).double()
+            print('Epoch: [{}][{}/{}]\tLoss {:.4f}\tWeighted_Acc {:.4f}\tVal P {:.4f}\tVal R {:.4f}'.format(epoch, iterations % len(train_dl.dataset),len(train_dl.dataset), np.mean(np.array(val_loss)),100.0*np.mean(np.array(val_acc)),np.mean(np.array(val_p)),np.mean(np.array(val_r))))
 
-                p = tp / (tp + fp + 1e-9)
-                r = tp / (tp + fn + 1e-9)
-                test_p.append(p.item())
-                test_r.append(r.item())
+            val_writer.add_scalar('Loss', np.mean(np.array(val_loss)), iterations)
+            val_writer.add_scalar('Weighted Accuracy', np.mean(np.array(val_acc)), iterations)
+            val_writer.add_scalar('Precision', np.mean(np.array(val_p)), iterations)
+            val_writer.add_scalar('Recall', np.mean(np.array(val_r)), iterations)
 
-            print('Epoch: [{}][{}/{}]\tLoss {:.4f}\tweighted Accuracy {:.2f} %'.format(epoch, iteration % len(train_dataloader.dataset),
-                                                                                        len(train_dataloader.dataset),
-                                                                                        np.mean(np.array(test_loss)),
-                                                                                        100.0*np.mean(np.array(acc))))
-
-            print('P {:.2f}% \t R {:.2f}%'.format(100.0*np.mean(np.array(test_p)), 100.0*np.mean(np.array(test_r))))
-
-            # show loss and accuracy
-            val_loss = np.mean(np.array(test_loss))
-            # val_writer.add_scalar('Weighted Accuracy', np.mean(np.array(acc)), iteration)
-
-            # val_writer.add_scalar('recall', np.mean(np.array(test_r)), iteration)
-
-            # val_writer.add_scalar('precision', np.mean(np.array(test_p)), iteration)
-            # val_writer.add_scalar('Loss', val_loss, iteration)
-
-            if old_acc < np.mean(np.array(acc)):
-                old_acc = np.mean(np.array(acc)) + 0.0
+            if np.mean(np.array(val_acc)) > last_acc:
                 is_best = True
+                last_acc = np.mean(np.array(val_acc)) + 0.0
+            
+            if is_best:
+                best_acc =np.mean(np.array(val_acc))
+                save_checkpt(model=model,epoch=epoch,optimizer=optimizer,best_acc=best_acc)
+        iterations += 1
 
-            # save checkpoints
-            # save_checkpoint({
-            #     'epoch': epoch + 1,
-            #     'iters': iteration,
-            #     'state_dict': model.state_dict(),
-            #     'best_prec1': np.mean(np.array(acc)),
-            #     'optimizer': optimizer.state_dict(),
-            # }, is_best, os.path.join(args.save_path, args.save_name) + "/DHN_" + str(epoch+1) + "_.pth.tar",
-            # best_model_name=os.path.join(args.save_path, args.save_name) + "/DHN_" + str(epoch+1) + "_best.pth.tar")
 
-            # is_best = False
-        iteration += 1
+
+
+

@@ -77,7 +77,7 @@ class Deep_Hungarian_net(nn.Module):
                 torch.nn.init.constant_(m.bias.data, 0.0)
 
     def init_hidden(self, batch_size):
-        return torch.zeros(4, batch_size, self.hidden_size)
+        return torch.zeros(4, batch_size, self.hidden_size).cuda()
 
     def forward(self, x):
         #row-wise flatten the data
